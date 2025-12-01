@@ -252,11 +252,9 @@ void test2()
 
     test_lamniscate(X, N);  // create test data around the lamniscate
     save_nd_data("test2.csv", X, N, features);  // save test data points
-    save_nd_data("w21.csv", W, num_out,
-                 features);  // save initial random weights
+    save_nd_data("w21.csv", W, num_out, features);  // save initial random weights
     kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w22.csv", W, num_out,
-                 features);  // save the resultant weights
+    save_nd_data("w22.csv", W, num_out, features);  // save the resultant weights
 
     for (int i = 0; i < max(num_out, N); i++)
     {
@@ -284,8 +282,7 @@ void test_3d_classes(double *const *data, int N)
 
     for (i = 0; i < N; i++)
     {
-        int class =
-            rand() % num_classes;  // select a random class for the point
+        int class = rand() % num_classes;  // select a random class for the point
 
         // create random coordinates (x,y,z) around the centre of the class
         data[i][0] = _random(centres[class][0] - R, centres[class][0] + R);
@@ -316,11 +313,9 @@ void test3()
 
     test_3d_classes(X, N);  // create test data around the lamniscate
     save_nd_data("test3.csv", X, N, features);  // save test data points
-    save_nd_data("w31.csv", W, num_out,
-                 features);  // save initial random weights
+    save_nd_data("w31.csv", W, num_out, features);  // save initial random weights
     kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w32.csv", W, num_out,
-                 features);  // save the resultant weights
+    save_nd_data("w32.csv", W, num_out, features);  // save the resultant weights
 
     for (int i = 0; i < max(num_out, N); i++)
     {
