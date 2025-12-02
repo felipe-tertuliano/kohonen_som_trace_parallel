@@ -1,8 +1,11 @@
+#include <cuda_runtime_api.h>
+#define __CUDA_INCLUDE_COMPILER_INTERNAL_HEADERS__
+
 #define _USE_MATH_DEFINES
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <math.h>
 
 #ifndef max
 /** shorthand for maximum value */
@@ -83,6 +86,68 @@ void kohonen_get_min_1d(double const *X, int N, double *val, int *idx)
 
 /**
  * Update weights of the SOM using Kohonen algorithm
+ * \param[in] x data point (device pointer)
+ * \param[in,out] W weights matrix (device pointer)
+ * \param[in,out] D temporary vector to store distances (device pointer)
+ * \param[in] num_out number of output points
+ * \param[in] num_features number of features per input sample
+ * \param[in] alpha learning rate \f$0<\alpha\le1\f$
+ * \param[in] R neighborhood range
+ */
+__global__ void kohonen_update_weights_kernel(double const *x, double *W, double *D, int num_out, int num_features, double alpha, int R)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int k;
+    
+    if (j < num_out)
+    {
+        double distance = 0.0;
+        for (k = 0; k < num_features; k++)
+        {
+            double diff = W[j * num_features + k] - x[k];
+            distance += diff * diff;
+        }
+        D[j] = distance;
+    }
+    
+    __syncthreads();
+    
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        int d_min_idx = 0;
+        double d_min = D[0];
+        for (int idx = 1; idx < num_out; idx++)
+        {
+            if (D[idx] < d_min)
+            {
+                d_min = D[idx];
+                d_min_idx = idx;
+            }
+        }
+        
+        int from_node = max(0, d_min_idx - R);
+        int to_node = min(num_out, d_min_idx + R + 1);
+        
+        __shared__ int shared_from_node, shared_to_node;
+        shared_from_node = from_node;
+        shared_to_node = to_node;
+        
+        __syncthreads();
+        
+        j = blockIdx.x * blockDim.x + threadIdx.x;
+        if (j >= shared_from_node && j < shared_to_node)
+        {
+            for (k = 0; k < num_features; k++)
+            {
+                int weight_idx = j * num_features + k;
+                W[weight_idx] += alpha * (x[k] - W[weight_idx]);
+            }
+        }
+    }
+}
+
+/**
+ * Update weights of the SOM using Kohonen algorithm
  * \param[in] x data point
  * \param[in,out] W weights matrix
  * \param[in,out] D temporary vector to store distances
@@ -91,36 +156,20 @@ void kohonen_get_min_1d(double const *X, int N, double *val, int *idx)
  * \param[in] alpha learning rate \f$0<\alpha\le1\f$
  * \param[in] R neighborhood range
  */
-void kohonen_update_weights(double const *x, double *const *W, double *D, int num_out, int num_features, double alpha, int R)
+void kohonen_update_weights(double const *x, double *W, double *D, int num_out, int num_features, double alpha, int R)
 {
-    int j, k;
-
-    // step 1: for each output point
-    for (j = 0; j < num_out; j++)
+    int block_size = 256;
+    int grid_size = (num_out + block_size - 1) / block_size;
+    
+    kohonen_update_weights_kernel<<<grid_size, block_size>>>(x, W, D, num_out, num_features, alpha, R);
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
     {
-        D[j] = 0.f;
-        // compute Euclidian distance of each output
-        // point from the current sample
-        for (k = 0; k < num_features; k++)
-            D[j] += (W[j][k] - x[k]) * (W[j][k] - x[k]);
+        fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
     }
-
-    // step 2:  get closest node i.e., node with smallest Euclidian distance to
-    // the current pattern
-    int d_min_idx;
-    double d_min;
-    kohonen_get_min_1d(D, num_out, &d_min, &d_min_idx);
-
-    // step 3a: get the neighborhood range
-    int from_node = max(0, d_min_idx - R);
-    int to_node = min(num_out, d_min_idx + R + 1);
-
-    // step 3b: update the weights of nodes in the
-    // neighborhood
-    for (j = from_node; j < to_node; j++)
-        for (k = 0; k < num_features; k++)
-            // update weights of nodes in the neighborhood
-            W[j][k] += alpha * (x[k] - W[j][k]);
+    
+    cudaDeviceSynchronize();
 }
 
 /**
@@ -132,7 +181,7 @@ void kohonen_update_weights(double const *x, double *const *W, double *D, int nu
  * \param[in] num_out number of output points
  * \param[in] alpha_min terminal value of alpha
  */
-void kohonen_som_tracer(double **X, double *const *W, int num_samples, int num_features, int num_out, double alpha_min)
+void kohonen_som_tracer(double **X, double *W, int num_samples, int num_features, int num_out, double alpha_min)
 {
     int R = num_out >> 2, iter = 0;
     double alpha = 1.f;
@@ -187,7 +236,7 @@ void test1()
     double **X = (double **)malloc(N * sizeof(double *));
 
     // number of clusters nodes * 2
-    double **W = (double **)malloc(num_out * sizeof(double *));
+    double *W = (double *)malloc(num_out * features * sizeof(double));
 
     for (int i = 0; i < max(num_out, N); i++)  // loop till max(N, num_out)
     {
@@ -195,25 +244,24 @@ void test1()
             X[i] = (double *)malloc(features * sizeof(double));
         if (i < num_out)  // only add new arrays if i < num_out
         {
-            W[i] = (double *)malloc(features * sizeof(double));
             // preallocate with random initial weights
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+            for (j = 1; j <= features; j++) W[i * j] = _random(-1, 1);
         }
     }
 
     test_circle(X, N);  // create test data around circumference of a circle
-    save_nd_data("test1.csv", X, N, features);  // save test data points
-    save_nd_data("w11.csv", W, num_out, features);  // save initial random weights
+    // save_nd_data("test1.csv", X, N, features);  // save test data points
+    // save_nd_data("w11.csv", W, num_out, features);  // save initial random weights
     kohonen_som_tracer(X, W, N, features, num_out, 0.1);  // train the SOM
-    save_nd_data("w12.csv", W, num_out, features);  // save the resultant weights
+    // save_nd_data("w12.csv", W, num_out, features);  // save the resultant weights
 
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
-    }
+    // for (int i = 0; i < max(num_out, N); i++)
+    // {
+    //     if (i < N)
+    //         free(X[i]);
+    //     if (i < num_out)
+    //         free(W[i]);
+    // }
 }
 
 void test_lamniscate(double *const *data, int N)
@@ -236,35 +284,33 @@ void test2()
     int features = 2;
     int num_out = 20;
     double **X = (double **)malloc(N * sizeof(double *));
-    double **W = (double **)malloc(num_out * sizeof(double *));
+    double *W = (double *)malloc(num_out * features * sizeof(double));
     for (int i = 0; i < max(num_out, N); i++)
     {
         if (i < N)  // only add new arrays if i < N
             X[i] = (double *)malloc(features * sizeof(double));
         if (i < num_out)  // only add new arrays if i < num_out
         {
-            W[i] = (double *)malloc(features * sizeof(double));
-
             // preallocate with random initial weights
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+            for (j = 1; j <= features; j++) W[i * j] = _random(-1, 1);
         }
     }
 
     test_lamniscate(X, N);  // create test data around the lamniscate
-    save_nd_data("test2.csv", X, N, features);  // save test data points
-    save_nd_data("w21.csv", W, num_out, features);  // save initial random weights
+    // save_nd_data("test2.csv", X, N, features);  // save test data points
+    // save_nd_data("w21.csv", W, num_out, features);  // save initial random weights
     kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w22.csv", W, num_out, features);  // save the resultant weights
+    // save_nd_data("w22.csv", W, num_out, features);  // save the resultant weights
 
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
-    }
-    free(X);
-    free(W);
+    // for (int i = 0; i < max(num_out, N); i++)
+    // {
+    //     if (i < N)
+    //         free(X[i]);
+    //     if (i < num_out)
+    //         free(W[i]);
+    // }
+    // free(X);
+    // free(W);
 }
 
 void test_3d_classes(double *const *data, int N)
@@ -297,35 +343,33 @@ void test3()
     int features = 3;
     int num_out = 20;
     double **X = (double **)malloc(N * sizeof(double *));
-    double **W = (double **)malloc(num_out * sizeof(double *));
+    double *W = (double *)malloc(num_out * features * sizeof(double));
     for (int i = 0; i < max(num_out, N); i++)
     {
         if (i < N)  // only add new arrays if i < N
             X[i] = (double *)malloc(features * sizeof(double));
         if (i < num_out)  // only add new arrays if i < num_out
-        {
-            W[i] = (double *)malloc(features * sizeof(double));
-            
+        {            
             // preallocate with random initial weights
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+            for (j = 1; j <= features; j++) W[i * j] = _random(-1, 1);
         }
     }
 
     test_3d_classes(X, N);  // create test data around the lamniscate
-    save_nd_data("test3.csv", X, N, features);  // save test data points
-    save_nd_data("w31.csv", W, num_out, features);  // save initial random weights
+    // save_nd_data("test3.csv", X, N, features);  // save test data points
+    // save_nd_data("w31.csv", W, num_out, features);  // save initial random weights
     kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w32.csv", W, num_out, features);  // save the resultant weights
+    // save_nd_data("w32.csv", W, num_out, features);  // save the resultant weights
 
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
-    }
-    free(X);
-    free(W);
+    // for (int i = 0; i < max(num_out, N); i++)
+    // {
+    //     if (i < N)
+    //         free(X[i]);
+    //     if (i < num_out)
+    //         free(W[i]);
+    // }
+    // free(X);
+    // free(W);
 }
 
 /**
