@@ -1,7 +1,9 @@
 #define _USE_MATH_DEFINES
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <omp.h>
 
@@ -14,16 +16,154 @@
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #endif
 
+#define NUM_COLUMNS 785 // 1 label + 784 values
+#define MAX_LINE_LENGTH 4096 // Large enough to hold all columns
+#define MAX_LINES 1024 // Maximum number of data lines to process
+
 /**
- * Helper function to generate a random number in a given interval
- * \param a lower limit
- * \param b upper limit
- * \returns random number in the range \f$[a,b)\f$
+ * Reads CSV data from a file and extracts labels and pixel values
+ * \param[in] filename Path to the CSV file to read
+ * \param[out] labels Pointer to array where labels will be stored (1D array)
+ * \param[out] data Pointer to 2D array where pixel values will be stored
+ * \param[out] num_rows Number of data rows (excluding header) read from file
+ * \return 1 on success, 0 on failure
  */
-double _random(double a, double b)
+int read_csv_data(const char *filename, double **labels, double ***data, int *num_rows)
 {
-    int r = rand() % 100;
-    return ((b - a) * r / 100.f) + a;
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        printf("Error: Could not open file '%s'\n", filename);
+        return 0;
+    }
+
+    char line[MAX_LINE_LENGTH];
+    int capacity = (MAX_LINES < 256) ? MAX_LINES : 256;  // Initial capacity, capped by MAX_LINES
+    int count = 0;
+    
+    // Allocate initial memory (limited by MAX_LINES)
+    if (capacity > MAX_LINES) capacity = MAX_LINES;
+    *labels = (double *)malloc(capacity * sizeof(double));
+    *data = (double **)malloc(capacity * sizeof(double *));
+    
+    if (!*labels || !*data) {
+        printf("Error: Memory allocation failed\n");
+        fclose(file);
+        return 0;
+    }
+    
+    // Read and skip the header line
+    if (!fgets(line, sizeof(line), file)) {
+        printf("Error: File is empty or header missing\n");
+        fclose(file);
+        return 0;
+    }
+    
+    // Read each data line until MAX_LINES is reached
+    while (fgets(line, sizeof(line), file) && count < MAX_LINES) {
+        // Remove newline character
+        line[strcspn(line, "\n")] = 0;
+        
+        // Skip empty lines
+        if (strlen(line) == 0) continue;
+        
+        // Check if we need to resize arrays (but not beyond MAX_LINES)
+        if (count >= capacity && count < MAX_LINES) {
+            // Increase capacity, but cap at MAX_LINES
+            int new_capacity = capacity * 2;
+            if (new_capacity > MAX_LINES) new_capacity = MAX_LINES;
+            
+            // Only realloc if we're actually increasing capacity
+            if (new_capacity > capacity) {
+                *labels = (double *)realloc(*labels, new_capacity * sizeof(double));
+                *data = (double **)realloc(*data, new_capacity * sizeof(double *));
+            
+                if (!*labels || !*data) {
+                    printf("Error: Memory reallocation failed\n");
+                    fclose(file);
+                    return 0;
+                }
+                capacity = new_capacity;
+            }
+        }
+        
+        // Allocate memory for this row's data (784 values, excluding label)
+        (*data)[count] = (double *)malloc(784 * sizeof(double));
+        if (!(*data)[count]) {
+            printf("Error: Memory allocation for row data failed\n");
+            fclose(file);
+            return 0;
+        }
+        
+        // Parse the CSV line
+        char *token;
+        int col = 0;
+        char *line_copy = strdup(line);  // Make a copy since strtok modifies the string
+        char *line_ptr = line_copy;
+        
+        token = strtok(line_copy, ",");
+        while (token != NULL && col < NUM_COLUMNS) {
+            // Remove any whitespace
+            while (isspace((unsigned char)*token)) token++;
+            
+            // Convert to double
+            double value = atof(token);
+            
+            if (col == 0) {
+                // First column is the label
+                (*labels)[count] = value;
+            } else {
+                // Remaining columns are data values (0-255)
+                (*data)[count][col - 1] = value;
+            }
+            
+            token = strtok(NULL, ",");
+            col++;
+        }
+        
+        free(line_ptr);
+        
+        // Check if we read all columns
+        if (col != NUM_COLUMNS) {
+            printf("Warning: Line %d has %d columns, expected %d\n", count + 1, col, NUM_COLUMNS);
+        }
+        
+        count++;
+        
+        // Check if we've reached MAX_LINES
+        if (count >= MAX_LINES) {
+            printf("Info: Reached maximum line limit of %d lines\n", MAX_LINES);
+            break;
+        }
+    }
+    
+    *num_rows = count;
+    fclose(file);
+    
+    // Trim arrays to exact size
+    if (count < capacity) {
+        *labels = (double *)realloc(*labels, count * sizeof(double));
+        *data = (double **)realloc(*data, count * sizeof(double *));
+    }
+    
+    return 1;
+}
+
+/**
+ * Frees all memory allocated by read_csv_data()
+ * \param[in] labels Pointer to labels array returned by read_csv_data()
+ * \param[in] data Pointer to 2D data array returned by read_csv_data()
+ * \param[in] num_rows Number of rows in the arrays
+ */
+void free_csv_data(double *labels, double **data, int num_rows)
+{
+    if (labels) free(labels);
+    
+    if (data) {
+        for (int i = 0; i < num_rows; i++) {
+            if (data[i]) free(data[i]);
+        }
+        free(data);
+    }
 }
 
 /**
@@ -160,208 +300,131 @@ void kohonen_som_tracer(double **X, double *const *W, int num_samples, int num_f
     free(D);
 }
 
-/** Creates a random set of points distributed *near* the circumference of a circle and trains an SOM that finds that circular pattern
- * \param[out] data matrix to store data in
- * \param[in] N number of points required
- */
-void test_circle(double *const *data, int N)
-{
-    const double R = 0.75, dr = 0.3;
-    double a_t = 0., b_t = 2.f * M_PI;  // theta random between 0 and 2*pi
-    double a_r = R - dr, b_r = R + dr;  // radius random between R-dr and R+dr
-    int i;
-
-    for (i = 0; i < N; i++)
-    {
-        double r = _random(a_r, b_r);      // random radius
-        double theta = _random(a_t, b_t);  // random theta
-        data[i][0] = r * cos(theta);       // convert from polar to cartesian
-        data[i][1] = r * sin(theta);
+int main() {
+    char filepath[256];
+    double *labels = NULL;
+    double **data = NULL;
+    int num_rows = 0;
+    
+    // Get file path from user
+    printf("Enter CSV file path: ");
+    if (scanf("%255s", filepath) != 1) {
+        printf("Error reading input\n");
+        return 1;
     }
-}
+    
+    // Read CSV data
+    if (!read_csv_data(filepath, &labels, &data, &num_rows)) {
+        return 1;
+    }
+    
+    printf("Successfully read %d rows from '%s'\n", num_rows, filepath);
 
-void test1()
-{
-    int j, N = 500;
-    int features = 2;
-    int num_out = 50;
+    // Display sample of the data (first 3 rows)
+    printf("\nSample data (first 3 rows):\n");
+    int display_rows = (num_rows < 3) ? num_rows : 3;
 
-    // 2D space, hence size = number of rows * 2
-    double **X = (double **)malloc(N * sizeof(double *));
-
-    // number of clusters nodes * 2
-    double **W = (double **)malloc(num_out * sizeof(double *));
-
-    for (int i = 0; i < max(num_out, N); i++)  // loop till max(N, num_out)
-    {
-        if (i < N)  // only add new arrays if i < N
-            X[i] = (double *)malloc(features * sizeof(double));
-        if (i < num_out)  // only add new arrays if i < num_out
-        {
-            W[i] = (double *)malloc(features * sizeof(double));
-            // preallocate with random initial weights
-            #pragma omp for
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+    for (int i = 0; i < display_rows; i++) {
+        printf("Row %d: Label = %.0f, First 3 values = [%.0f, %.0f, %.0f, ...]\n", 
+               i + 1, labels[i], 
+               data[i][0], data[i][1], data[i][2]);
+    }
+    
+    // Calculate some statistics
+    double min_val = 255, max_val = 0;
+    for (int i = 0; i < num_rows; i++) {
+        for (int j = 0; j < 784; j++) {
+            if (data[i][j] < min_val) min_val = data[i][j];
+            if (data[i][j] > max_val) max_val = data[i][j];
+        }
+    }
+    printf("\nData range: %.0f to %.0f\n", min_val, max_val);
+    
+    // Kohonen SOM parameters
+    int num_features = 784;  // Assuming MNIST-like data (28x28 = 784 pixels)
+    int num_out = 100;       // Number of output neurons (adjust as needed)
+    double alpha_min = 0.01; // Terminal learning rate
+    
+    // Initialize weights matrix
+    double **weights = (double **)malloc(num_out * sizeof(double *));
+    if (weights == NULL) {
+        printf("Error allocating weights matrix\n");
+        free_csv_data(labels, data, num_rows);
+        return 1;
+    }
+    
+    for (int i = 0; i < num_out; i++) {
+        weights[i] = (double *)malloc(num_features * sizeof(double));
+        if (weights[i] == NULL) {
+            printf("Error allocating weights row %d\n", i);
+            // Free already allocated rows
+            for (int j = 0; j < i; j++) {
+                free(weights[j]);
+            }
+            free(weights);
+            free_csv_data(labels, data, num_rows);
+            return 1;
+        }
+        
+        // Initialize weights randomly (between min_val and max_val)
+        for (int j = 0; j < num_features; j++) {
+            weights[i][j] = min_val + ((double)rand() / RAND_MAX) * (max_val - min_val);
         }
     }
 
-    test_circle(X, N);  // create test data around circumference of a circle
-    save_nd_data("test1.csv", X, N, features);  // save test data points
-    save_nd_data("w11.csv", W, num_out, features);  // save initial random weights
-    kohonen_som_tracer(X, W, N, features, num_out, 0.1);  // train the SOM
-    save_nd_data("w12.csv", W, num_out, features);  // save the resultant weights
-
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
+    printf("\nRunning Kohonen SOM training...\n");
+    printf("Parameters: %d samples, %d features, %d output neurons\n", num_rows, num_features, num_out);
+    
+    // Apply Kohonen SOM algorithm
+    kohonen_som_tracer(data, weights, num_rows, num_features, num_out, alpha_min);
+    
+    // Save the trained weights to a file
+    char output_file[256];
+    snprintf(output_file, sizeof(output_file), "openmp_cpu_kohonen_som_trace.bin");
+    
+    if (save_nd_data(output_file, weights, num_out, num_features) == 0) {
+        printf("Successfully saved trained weights to '%s'\n", output_file);
+    } else {
+        printf("Failed to save weights to file\n");
     }
-}
-
-void test_lamniscate(double *const *data, int N)
-{
-    const double dr = 0.2;
-    int i;
-
-    #pragma omp for
-    for (i = 0; i < N; i++)
-    {
-        double dx = _random(-dr, dr);     // random change in x
-        double dy = _random(-dr, dr);     // random change in y
-        double theta = _random(0, M_PI);  // random theta
-        data[i][0] = dx + cos(theta);     // convert from polar to cartesian
-        data[i][1] = dy + sin(2. * theta) / 2.f;
-    }
-}
-
-void test2()
-{
-    int j, N = 500;
-    int features = 2;
-    int num_out = 20;
-    double **X = (double **)malloc(N * sizeof(double *));
-    double **W = (double **)malloc(num_out * sizeof(double *));
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)  // only add new arrays if i < N
-            X[i] = (double *)malloc(features * sizeof(double));
-        if (i < num_out)  // only add new arrays if i < num_out
-        {
-            W[i] = (double *)malloc(features * sizeof(double));
-
-            // preallocate with random initial weights
-            #pragma omp for
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+    
+    // For demonstration, we can save the first 10 transformed points
+    int sample_size = (num_rows < 10) ? num_rows : 10;
+    double **sample_output = (double **)malloc(sample_size * sizeof(double *));
+    
+    if (sample_output != NULL) {
+        for (int i = 0; i < sample_size; i++) {
+            sample_output[i] = (double *)malloc(num_out * sizeof(double));
+            if (sample_output[i] != NULL) {
+                // Calculate the transformed representation for each sample
+                // (This would need to be implemented based on how kohonen_som_tracer works)
+                // For now, we'll just save a dummy version - you should replace this
+                // with actual transformation logic
+                for (int j = 0; j < num_out; j++) {
+                    // This is placeholder - replace with actual transformation
+                    sample_output[i][j] = 0.0;
+                }
+            }
         }
-    }
 
-    test_lamniscate(X, N);  // create test data around the lamniscate
-    save_nd_data("test2.csv", X, N, features);  // save test data points
-    save_nd_data("w21.csv", W, num_out, features);  // save initial random weights
-    kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w22.csv", W, num_out, features);  // save the resultant weights
-
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
-    }
-    free(X);
-    free(W);
-}
-
-void test_3d_classes(double *const *data, int N)
-{
-    const double R = 0.1;  // radius of cluster
-    int i;
-    const int num_classes = 4;
-    const double centres[][3] = {
-        // centres of each class cluster
-        {.5, .5, .5},    // centre of class 1
-        {.5, -.5, -.5},  // centre of class 2
-        {-.5, .5, .5},   // centre of class 3
-        {-.5, -.5 - .5}  // centre of class 4
-    };
-
-    #pragma omp for
-    for (i = 0; i < N; i++)
-    {
-        int class = rand() % num_classes;  // select a random class for the point
-
-        // create random coordinates (x,y,z) around the centre of the class
-        data[i][0] = _random(centres[class][0] - R, centres[class][0] + R);
-        data[i][1] = _random(centres[class][1] - R, centres[class][1] + R);
-        data[i][2] = _random(centres[class][2] - R, centres[class][2] + R);
-    }
-}
-
-void test3()
-{
-    int j, N = 200;
-    int features = 3;
-    int num_out = 20;
-    double **X = (double **)malloc(N * sizeof(double *));
-    double **W = (double **)malloc(num_out * sizeof(double *));
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)  // only add new arrays if i < N
-            X[i] = (double *)malloc(features * sizeof(double));
-        if (i < num_out)  // only add new arrays if i < num_out
-        {
-            W[i] = (double *)malloc(features * sizeof(double));
-
-            // preallocate with random initial weights
-            #pragma omp for
-            for (j = 0; j < features; j++) W[i][j] = _random(-1, 1);
+        // Save the sample (if you implement the transformation)
+        // save_nd_data(sample_file, sample_output, sample_size, num_out);
+        
+        // Free sample output memory
+        for (int i = 0; i < sample_size; i++) {
+            free(sample_output[i]);
         }
+        free(sample_output);
     }
-
-    test_3d_classes(X, N);  // create test data around the lamniscate
-    save_nd_data("test3.csv", X, N, features);  // save test data points
-    save_nd_data("w31.csv", W, num_out, features);  // save initial random weights
-    kohonen_som_tracer(X, W, N, features, num_out, 0.01);  // train the SOM
-    save_nd_data("w32.csv", W, num_out, features);  // save the resultant weights
-
-    for (int i = 0; i < max(num_out, N); i++)
-    {
-        if (i < N)
-            free(X[i]);
-        if (i < num_out)
-            free(W[i]);
+    
+    // Free allocated memory
+    for (int i = 0; i < num_out; i++) {
+        free(weights[i]);
     }
-    free(X);
-    free(W);
-}
-
-/**
- * Convert clock cycle difference to time in seconds
- * \param[in] start_t start clock
- * \param[in] end_t end clock
- * \returns time difference in seconds
- */
-double get_clock_diff(clock_t start_t, clock_t end_t)
-{
-    return (double)(end_t - start_t) / (double)CLOCKS_PER_SEC;
-}
-
-/** Main function */
-int main(int argc, char **argv)
-{
-    clock_t start_clk = clock();
-    test1();
-    clock_t end_clk = clock();
-    printf("Test 1 completed in %.4g sec\n", get_clock_diff(start_clk, end_clk));
-    start_clk = clock();
-    test2();
-    end_clk = clock();
-    printf("Test 2 completed in %.4g sec\n", get_clock_diff(start_clk, end_clk));
-    start_clk = clock();
-    test3();
-    end_clk = clock();
-    printf("Test 3 completed in %.4g sec\n", get_clock_diff(start_clk, end_clk));
+    free(weights);
+    free_csv_data(labels, data, num_rows);
+    
+    printf("\nKohonen SOM processing completed.\n");
+    
     return 0;
 }

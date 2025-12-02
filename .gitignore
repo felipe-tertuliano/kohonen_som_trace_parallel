@@ -3,4 +3,5 @@
 !*.**
 !.gitignore
 
+*.bin
 mnist_test.csv
